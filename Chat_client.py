@@ -1,7 +1,9 @@
+import json
 import logging
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 
 from google.genai import types
@@ -18,6 +20,17 @@ logger = logging.getLogger(__name__)
 request_id = uuid.uuid4().hex
 
 
+def record_observation(category, event, **details):
+    observation = {
+        "category": category,
+        "event": event,
+        "request_id": request_id,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        **details,
+    }
+    logger.info("observation %s", json.dumps(observation, default=str))
+
+
 @contextmanager
 def track_component(component, **fields):
     context = " ".join(f"{key}={value}" for key, value in fields.items())
@@ -26,12 +39,20 @@ def track_component(component, **fields):
     logger.info("component_started %s", details)
     try:
         yield
-    except Exception:
+    except Exception as exc:
         duration_ms = (time.perf_counter() - start_time) * 1000
         logger.exception(
             "component_failed %s duration_ms=%.2f",
             details,
             duration_ms,
+        )
+        record_observation(
+            "system_feedback",
+            "component_failed",
+            component=component,
+            status="error",
+            error_type=type(exc).__name__,
+            status_code=getattr(exc, "status_code", None),
         )
         raise
     else:
@@ -40,6 +61,13 @@ def track_component(component, **fields):
             "component_completed %s duration_ms=%.2f",
             details,
             duration_ms,
+        )
+        record_observation(
+            "system_feedback",
+            "component_completed",
+            component=component,
+            status="success",
+            duration_ms=round(duration_ms, 2),
         )
 
 
@@ -68,8 +96,19 @@ with track_component("weather_tool.registration"):
     )
 
 def get_weather(location):
-    """Get the current weather in a given location."""
-    return f"the weather in {location} is cloudy with low temperatures. \n"
+    """Return demo weather data; replace this with a real weather provider."""
+    result = {
+        "source": "demo_mock",
+        "location": location,
+        "condition": "cloudy with low temperatures",
+        "measurement_time": None,
+    }
+    record_observation(
+        "environmental_data",
+        "weather_result",
+        **result,
+    )
+    return result
 
 with track_component("gemini_request.configuration"):
     config = types.GenerateContentConfig(
@@ -130,12 +169,22 @@ def send_message_with_observability(message, stage):
     return result
 
 
-logger.info("request_started request_id=%s", request_id)
+request_started_at = datetime.now(timezone.utc)
+request_start = time.perf_counter()
+record_observation("time_based_events", "request_started")
 response = send_message_with_observability(prompt, "initial")
 
 # 4. Check if the model wants to call a function
 with track_component("model_response.tool_check"):
     has_tool_call = bool(response.function_calls)
+    record_observation(
+        "response_analysis",
+        "model_response_received",
+        stage="initial",
+        has_text=bool(response.text),
+        text_length=len(response.text or ""),
+        function_call_count=len(response.function_calls or []),
+    )
 
 if has_tool_call:
     call = response.function_calls[0]
@@ -151,6 +200,12 @@ if has_tool_call:
                 request_id,
                 call.name,
             )
+            record_observation(
+                "system_feedback",
+                "unknown_tool",
+                status="error",
+                tool=call.name,
+            )
             tool_result = f"Error: Function {call.name} not found."
 
     # 5. Send the function result back to Gemini
@@ -162,7 +217,19 @@ if has_tool_call:
         "tool_result",
     )
 
-logger.info("request_completed request_id=%s", request_id)
+record_observation(
+    "response_analysis",
+    "final_response_received",
+    has_text=bool(response.text),
+    text_length=len(response.text or ""),
+    function_call_count=len(response.function_calls or []),
+)
+record_observation(
+    "time_based_events",
+    "request_completed",
+    duration_ms=round((time.perf_counter() - request_start) * 1000, 2),
+    started_at=request_started_at.isoformat(),
+)
 with track_component("response.output"):
     print("\nFinal Response from Gemini:")
     print(response.text)
